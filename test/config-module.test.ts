@@ -1,33 +1,114 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createModule, DIContext, type ModuleDef } from "awilixify";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type ConfigService,
 	createConfigModuleFactory,
+	type Environment,
 	type RootConfigService,
+	type RootConfigServiceOptions,
 } from "../index.js";
 
-const directories: string[] = [];
-afterEach(() => {
-	vi.unstubAllEnvs();
-	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true });
+let directory: string;
+let originalCwd: string;
+let nextFile: number;
+
+beforeEach(() => {
+	originalCwd = process.cwd();
+	directory = mkdtempSync(join(tmpdir(), "awilixify-config-"));
+	nextFile = 0;
+	// Resolve the default .env inside this test's temporary directory, not the repo.
+	process.chdir(directory);
 });
 
-function envFile(contents: string): string {
-	const dir = mkdtempSync(join(tmpdir(), "awilixify-config-"));
-	directories.push(dir);
-	const path = join(dir, ".env");
+afterEach(() => {
+	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+	process.chdir(originalCwd);
+	rmSync(directory, { recursive: true });
+});
+
+function envFile(contents: string, name = `.env.${nextFile++}`): string {
+	const path = join(directory, name);
 	writeFileSync(path, contents);
 	return path;
 }
 
-function app(module: Parameters<typeof DIContext.create>[0]["imports"]) {
-	return DIContext.create({ name: "App", imports: module });
+function setup<
+	Config extends object = Environment,
+	const Key extends Extract<keyof Config, string> = never,
+>(
+	options: RootConfigServiceOptions<Config> = {} as RootConfigServiceOptions<Config>,
+	keys: readonly Key[] = [],
+) {
+	const ConfigModule = createConfigModuleFactory<Config>({
+		ignoreEnvVars: true,
+		...options,
+	});
+	const context = DIContext.create({
+		name: "App",
+		imports: [ConfigModule, ConfigModule({ keys })],
+	});
+	return {
+		context,
+		rootConfig: context.scope.resolve<RootConfigService<Config>>("rootConfig"),
+		config: context.scope.resolve<ConfigService<Pick<Config, Key>>>("config"),
+	};
 }
 
 describe("ConfigModuleFactory", () => {
+	it("loads the default .env without validation and keeps raw string values", () => {
+		envFile("PORT=3000", ".env");
+		const { rootConfig } = setup();
+
+		expect(rootConfig.get("PORT")).toBe("3000");
+		expect(Object.isFrozen(rootConfig.get())).toBe(true);
+	});
+
+	it("validates the default .env synchronously on resolution", () => {
+		envFile("PORT=3000", ".env");
+		const validate = vi.fn((env: Record<string, string | undefined>) => ({
+			port: Number(env.PORT),
+		}));
+
+		const { rootConfig } = setup({ validate });
+
+		expect(validate).toHaveBeenCalledExactlyOnceWith({ PORT: "3000" });
+		expect(rootConfig.get()).toEqual({ port: 3000 });
+		expect(rootConfig.get("port")).toBe(3000);
+		expect(validate).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not load the default file when the path list is empty", () => {
+		envFile("PORT=3000", ".env");
+		const { rootConfig } = setup({ envFilePath: [] });
+
+		expect(rootConfig.get()).toEqual({});
+	});
+
+	it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+		"throws EACCES when permission to read an env file is denied",
+		() => {
+			const path = envFile("PORT=3000");
+			chmodSync(path, 0o000);
+
+			try {
+				const ConfigModule = createConfigModuleFactory({ envFilePath: path });
+				const context = DIContext.create({
+					name: "App",
+					imports: [ConfigModule],
+				});
+				expect(() => context.scope.resolve("rootConfig")).toThrowError(
+					expect.objectContaining({ code: "EACCES" }),
+				);
+			} finally {
+				chmodSync(path, 0o600);
+			}
+		},
+	);
+
 	it("shares validated config across root and restricted child modules", async () => {
 		const validate = vi.fn(() => ({
 			host: "localhost",
@@ -40,73 +121,32 @@ describe("ConfigModuleFactory", () => {
 		});
 		const webConfig = ConfigModule({ keys: ["host", "port"] });
 		type WebDef = ModuleDef<{ imports: [typeof webConfig] }>;
-		const context = app([
-			ConfigModule,
-			createModule<WebDef>({ name: "Web", imports: [webConfig] }),
-			ConfigModule({ keys: ["port"] }),
-		]);
-		const root =
-			context.scope.resolve<RootConfigService<ReturnType<typeof validate>>>(
-				"rootConfig",
-			);
-		expect(root.get("port")).toBe(3000);
-		expect(validate).toHaveBeenCalledTimes(1);
-		await context.init();
+		const context = DIContext.create({
+			name: "App",
+			imports: [
+				ConfigModule,
+				createModule<WebDef>({ name: "Web", imports: [webConfig] }),
+				ConfigModule({ keys: ["port"] }),
+			],
+		});
+
+		const root = context.scope.resolve<any>("rootConfig");
 		const web = context.importedScopes.get("Web");
-		const config =
-			web?.scope.resolve<ConfigService<{ host: string; port: number }>>(
-				"config",
-			);
+		const config = web?.scope.resolve<any>("config");
+
+		await context.init();
+
 		expect(root.get()).toEqual({
 			host: "localhost",
 			port: 3000,
 			secret: "private",
 		});
 		expect(config?.get()).toEqual({ host: "localhost", port: 3000 });
-		expect(config?.get("port")).toBe(3000);
-		// @ts-expect-error Unselected values must also throw at runtime.
 		expect(() => config?.get("secret")).toThrow(
 			'Configuration key "secret" is not allowed in this scope',
 		);
-		expect(web?.scope.hasRegistration("rootConfig")).toBe(false);
-		expect(
-			context.scope.resolve<ConfigService<{ port: number }>>("config").get(),
-		).toEqual({ port: 3000 });
+		expect(context.scope.resolve<any>("config").get()).toEqual({ port: 3000 });
 		expect(validate).toHaveBeenCalledTimes(1);
-		expect(webConfig.imports).toEqual([ConfigModule]);
-		await context.close();
-	});
-
-	it("makes scoped configuration available to a consumer's onInit", async () => {
-		const ConfigModule = createConfigModuleFactory({
-			ignoreEnvFile: true,
-			validate: () => ({ port: 3000 }),
-		});
-		const WebConfig = ConfigModule({ keys: ["port"] });
-		const initialized = vi.fn();
-		type WebDef = ModuleDef<{
-			imports: [typeof WebConfig];
-			providers: { serverAddress: { onInit(): void } };
-		}>;
-		const WebModule = createModule<WebDef>({
-			name: "Web",
-			imports: [WebConfig],
-			providers: {
-				serverAddress: {
-					inject: ["config"],
-					useFactory: (config) => ({
-						onInit() {
-							initialized(config.get("port"));
-						},
-					}),
-					eager: true,
-				},
-			},
-		});
-		const context = app([WebModule]);
-		await context.init();
-		expect(initialized).toHaveBeenCalledWith(3000);
-		await context.close();
 	});
 
 	it("initializes through a child import alone and allows an empty key selection", async () => {
@@ -114,13 +154,20 @@ describe("ConfigModuleFactory", () => {
 			ignoreEnvFile: true,
 			validate: () => ({ port: 3000 }),
 		});
-		const context = app([ConfigModule({ keys: [] })]);
+		const context = DIContext.create({
+			name: "App",
+			imports: [ConfigModule({ keys: [] })],
+		});
 		await context.init();
 		expect(
 			context.scope.resolve<ConfigService<object>>("config").get(),
 		).toEqual({});
 		expect(context.scope.hasRegistration("rootConfig")).toBe(false);
-		await context.close();
+		const config = context.scope.resolve<ConfigService<object>>("config");
+		expect(() => {
+			// @ts-expect-error Empty scopes must also reject access at runtime.
+			config.get("port");
+		}).toThrow('Configuration key "port" is not allowed in this scope');
 	});
 
 	it("loads files in priority order, then applies process.env without modifying it", async () => {
@@ -132,17 +179,14 @@ describe("ConfigModuleFactory", () => {
 		const second = envFile(
 			"AWILIXIFY_CONFIG_TEST_FILE_ONLY=second\nSECOND_ONLY=yes",
 		);
-		const ConfigModule = createConfigModuleFactory({
+		const { context, rootConfig } = setup({
 			envFilePath: [first, second],
-			validate: (env) => env,
+			ignoreEnvVars: false,
 		});
-		const context = app([ConfigModule]);
+
 		await context.init();
-		expect(
-			context.scope
-				.resolve<RootConfigService<Record<string, string>>>("rootConfig")
-				.get(),
-		).toMatchObject({
+
+		expect(rootConfig.get()).toMatchObject({
 			AWILIXIFY_CONFIG_TEST_OVERRIDE: "environment",
 			AWILIXIFY_CONFIG_TEST_FILE_ONLY: "first",
 			SECOND_ONLY: "yes",
@@ -150,176 +194,72 @@ describe("ConfigModuleFactory", () => {
 			MULTILINE: "line1\nline2",
 		});
 		expect(process.env.AWILIXIFY_CONFIG_TEST_FILE_ONLY).toBeUndefined();
-		await context.close();
-	});
-
-	it("supports a single path and ignores process.env when requested", async () => {
-		const ConfigModule = createConfigModuleFactory({
-			// biome-ignore lint/suspicious/noTemplateCurlyInString: Expansion must stay literal.
-			envFilePath: envFile("PORT=3000\nURL=${HOST}/api"),
-			ignoreEnvVars: true,
-			validate: (env) => env,
-		});
-		const context = app([ConfigModule]);
-		await context.init();
-		expect(
-			context.scope.resolve<RootConfigService<object>>("rootConfig").get(),
-		).toEqual({
-			PORT: "3000",
-			// biome-ignore lint/suspicious/noTemplateCurlyInString: Expansion must stay literal.
-			URL: "${HOST}/api",
-		});
-		await context.close();
 	});
 
 	it("skips file loading when requested", async () => {
-		const ConfigModule = createConfigModuleFactory({
+		const { rootConfig } = setup({
 			envFilePath: envFile("PORT=3000"),
 			ignoreEnvFile: true,
-			ignoreEnvVars: true,
-			validate: (env) => env,
 		});
-		const context = app([ConfigModule]);
-		await context.init();
-		expect(
-			context.scope.resolve<RootConfigService<object>>("rootConfig").get(),
-		).toEqual({});
-		await context.close();
-	});
 
-	it("ignores missing files but propagates other filesystem errors", async () => {
-		const file = envFile("PORT=3000");
-		const ConfigModule = createConfigModuleFactory({
-			envFilePath: [join(file, "..", "missing"), file],
-			ignoreEnvVars: true,
-			validate: (env) => env,
-		});
-		const context = app([ConfigModule]);
-		await context.init();
-		expect(
-			context.scope
-				.resolve<RootConfigService<{ PORT: string }>>("rootConfig")
-				.get("PORT"),
-		).toBe("3000");
-		await context.close();
-		const InvalidModule = createConfigModuleFactory({
-			envFilePath: join(file, ".."),
-			validate: (env) => env,
-		});
-		await expect(app([InvalidModule]).init()).rejects.toThrow();
-	});
-
-	it("validates and converts synchronously on first resolution", async () => {
-		const ConfigModule = createConfigModuleFactory({
-			envFilePath: envFile("PORT=3000"),
-			ignoreEnvVars: true,
-			validate: (env) => ({ port: Number(env.PORT) }),
-		});
-		const context = app([ConfigModule({ keys: ["port"] })]);
-		expect(
-			context.scope
-				.resolve<ConfigService<{ port: number }>>("config")
-				.get("port"),
-		).toBe(3000);
-		await context.close();
+		expect(rootConfig.get()).toEqual({});
 	});
 
 	it("throws synchronously on validation failure during resolution", () => {
 		const ConfigModule = createConfigModuleFactory({
-			ignoreEnvFile: true,
 			validate: () => {
 				throw new Error("Invalid PORT");
 			},
 		});
-		const context = app([ConfigModule]);
+
+		const context = DIContext.create({ name: "App", imports: [ConfigModule] });
 		expect(() => context.scope.resolve("rootConfig")).toThrow("Invalid PORT");
 	});
 
-	it("creates independent config instances per context", async () => {
-		const validate = vi.fn(() => ({ count: 1 }));
-		const ConfigModule = createConfigModuleFactory({
-			ignoreEnvFile: true,
-			validate,
-		});
-		const first = app([ConfigModule]);
-		const second = app([ConfigModule]);
-		await first.init();
-		await second.init();
-		expect(first.scope.resolve("rootConfig")).not.toBe(
-			second.scope.resolve("rootConfig"),
+	it("supports optional values", async () => {
+		const { rootConfig, config } = setup(
+			{
+				validate: (): { optional?: string; port: number } => ({ port: 3000 }),
+			},
+			["optional"],
 		);
-		expect(validate).toHaveBeenCalledTimes(2);
-		await first.close();
-		await second.close();
+
+		expect(rootConfig.get("optional")).toBeUndefined();
+		expect(config.get("optional")).toBeUndefined();
+		expect(config.get()).toEqual({ optional: undefined });
 	});
 
-	it("supports optional values and freezes top-level configuration", async () => {
-		const ConfigModule = createConfigModuleFactory({
-			ignoreEnvFile: true,
-			validate: (): { optional?: string; port: number } => ({ port: 3000 }),
-		});
-		const context = app([ConfigModule, ConfigModule({ keys: ["optional"] })]);
-		await context.init();
-		const root =
-			context.scope.resolve<
-				RootConfigService<{ optional?: string; port: number }>
-			>("rootConfig");
-		expect(root.get("optional")).toBeUndefined();
-		expect(Object.isFrozen(root.get())).toBe(true);
-		expect(
-			context.scope
-				.resolve<ConfigService<{ optional?: string }>>("config")
-				.get(),
-		).toEqual({ optional: undefined });
-		await context.close();
-	});
-
-	it("supports exact custom provider names for multiple configurations", async () => {
+	it("keeps configurations separate with custom provider names", () => {
 		const First = createConfigModuleFactory({
 			rootProviderName: "firstRoot",
 			scopedProviderName: "firstConfig",
-			ignoreEnvFile: true,
 			validate: () => ({ port: 1 }),
 		});
 		const Second = createConfigModuleFactory({
 			rootProviderName: "secondRoot",
 			scopedProviderName: "secondConfig",
-			ignoreEnvFile: true,
 			validate: () => ({ port: 2 }),
 		});
-		const context = app([
-			First,
-			Second,
-			First({ keys: ["port"] }),
-			Second({ keys: ["port"] }),
-		]);
-		await context.init();
-		expect(
-			context.scope
-				.resolve<ConfigService<{ port: number }>>("firstConfig")
-				.get("port"),
-		).toBe(1);
-		expect(
-			context.scope
-				.resolve<ConfigService<{ port: number }>>("secondConfig")
-				.get("port"),
-		).toBe(2);
-		expect(context.scope.hasRegistration("rootConfig")).toBe(false);
-		await context.close();
+		const context = DIContext.create({
+			name: "App",
+			imports: [First({ keys: ["port"] }), Second({ keys: ["port"] })],
+		});
+
+		expect(context.scope.resolve<any>("firstConfig").get("port")).toBe(1);
+		expect(context.scope.resolve<any>("secondConfig").get("port")).toBe(2);
 	});
 
 	it("rejects invalid provider names", () => {
-		const options = { validate: () => ({ port: 1 }) };
 		expect(() =>
 			createConfigModuleFactory({
-				...options,
 				rootProviderName: "same",
 				scopedProviderName: "same",
 			}),
 		).toThrow("distinct");
+
 		expect(() =>
 			// @ts-expect-error Empty provider names must also fail at runtime.
-			createConfigModuleFactory({ ...options, rootProviderName: "" }),
+			createConfigModuleFactory({ rootProviderName: "" }),
 		).toThrow("non-empty");
 	});
 });

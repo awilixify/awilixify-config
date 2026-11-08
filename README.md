@@ -67,39 +67,21 @@ const WebModule = createModule<WebDef>({
     },
   },
 });
-
-const context = DIContext.create({
-  name: "App",
-  imports: [ConfigModule, WebModule],
-});
-await context.init();
-// Use the application.
-await context.close();
 ```
-
-A child imports the root automatically. Importing the root at application level is optional. The child does not re-export `rootConfig`.
 
 - `config.get("port")` returns the property's inferred type.
 - `config.get()` returns a shallow-frozen, read-only object containing only selected keys.
 - An empty `keys` array exposes no configuration values.
 - Missing optional properties return `undefined`.
 
-Child services delegate to the shared root service and check every keyed read. Reading an unselected key throws at runtime, even if TypeScript checks are bypassed. `get()` without a key returns a shallow-frozen subset containing only allowed keys. Child services do not reload files or rerun validation. This is dependency scoping, not a security boundary. Nested values retain their original references and are not deeply frozen.
-
 ## Loading options
 
-| Option | Default | Behavior |
-| --- | --- | --- |
-| `envFilePath` | `".env"` | One path or a readonly array of paths, relative to the working directory. Earlier files win. |
-| `ignoreEnvFile` | `false` | Skip all file loading. |
-| `ignoreEnvVars` | `false` | Exclude `process.env` from validation input. |
-| `validate` | Omitted | Receives `Record<string, string \| undefined>` and synchronously returns a typed configuration object. |
-
-Existing `process.env` values override file values unless `ignoreEnvVars` is enabled. An empty string is an existing value and also takes precedence. Missing files are ignored so deployments can use environment variables without a file. Other read errors fail service construction.
-
-Files are parsed using `node:util`'s `parseEnv`, including its support for comments, quoted values and multiline strings. `${VARIABLE}` expansion is not supported. An empty `envFilePath` array skips files.
-
-Loading never writes to `process.env`. `validate` receives a merged copy, and its returned object is shallow-copied and frozen before exposure. Return a plain configuration object.
+| Option          | Default  | Behavior                                                                                               |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------ |
+| `envFilePath`   | `".env"` | One path or a readonly array of paths, relative to the working directory. Earlier files win.           |
+| `ignoreEnvFile` | `false`  | Skip all file loading.                                                                                 |
+| `ignoreEnvVars` | `false`  | Exclude `process.env` from validation input.                                                           |
+| `validate`      | Omitted  | Receives `Record<string, string \| undefined>` and synchronously returns a typed configuration object. |
 
 ## Custom provider names
 
@@ -114,14 +96,6 @@ const ServiceConfigModule = createConfigModuleFactory({
 ```
 
 Names must be non-empty string literals. Defaults are `rootConfig` and `config`.
-
-## Lifecycle
-
-Files are read and validation runs synchronously in the `RootConfigService` constructor, once per root module per DI context. This happens on first resolution, or during `await context.init()` if not resolved earlier. Several child modules share the same root service. Each context owns its own services. Configuration is a startup snapshot, not a live view of files or `process.env`.
-
-Configuration is available immediately after service construction, including in dependent constructors and provider factories. File-loading and validation errors throw during construction and reject `context.init()` if construction occurs there.
-
-The package does not augment Awilixify's global dependencies. Import the appropriate module to declare each feature's configuration dependency explicitly.
 
 ## Development
 

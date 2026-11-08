@@ -51,9 +51,9 @@ export class RootConfigService<Config extends object = Environment> {
 				? [paths]
 				: paths;
 
-		const env = files.reduce<Environment>((env, path) => {
+		const env = files.reduceRight<Environment>((env, path) => {
 			try {
-				return { ...parseEnv(readFileSync(path, "utf8")), ...env };
+				return Object.assign(env, parseEnv(readFileSync(path, "utf8")));
 			} catch (error) {
 				// Missing env files are optional; deployments can supply process.env instead.
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return env;
